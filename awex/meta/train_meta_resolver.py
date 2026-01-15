@@ -20,6 +20,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+import torch
 from torch import distributed as dist
 from transformers import PretrainedConfig
 
@@ -156,7 +157,23 @@ class McoreParamMetaResolver(ParamMetaResolver):
         logger.info(
             f"Starting all_gather_object of {dist.get_world_size()}, current rank {dist.get_rank()}"
         )
-        dist.all_gather_object(global_metadata, meta)
+        # In colocate mode, GPU memory is partially offloaded, so we need to use Gloo backend
+        # for collective operations instead of NCCL which requires CUDA memory
+        enable_colocate = getattr(
+            self._infer_conf.get("infer_engine_config"), "enable_colocate_mode", False
+        )
+        if enable_colocate:
+            # Create or get a Gloo-based process group for CPU collective operations
+            if not hasattr(self, '_gloo_group'):
+                import os
+                # Create a Gloo group with same ranks as the default group
+                self._gloo_group = dist.new_group(
+                    ranks=list(range(dist.get_world_size())),
+                    backend='gloo'
+                )
+            dist.all_gather_object(global_metadata, meta, group=self._gloo_group)
+        else:
+            dist.all_gather_object(global_metadata, meta)
         return global_metadata
 
     def _get_sharding_info(

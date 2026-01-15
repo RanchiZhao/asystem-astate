@@ -23,7 +23,7 @@ from transformers import PretrainedConfig
 from awex import logging
 from awex.converter.mcore_converter import McoreToHFWeightConverter
 from awex.converter.sglang_converter import SGlangToHFWeightConverter
-from awex.converter.weights_converter import per_block_cast_to_fp8
+from awex.converter.weights_converter import quantize_weight
 from awex.sharding.param_sharding import ShardingStrategy, ShardingType
 from awex.sharding.rank_info import RankInfo
 
@@ -54,12 +54,14 @@ class McoreToHFWeightConverterBailingMoe(McoreToHFWeightConverter):
         self, hf_config: PretrainedConfig, rank_info: RankInfo, infer_conf: Dict
     ):
         super().__init__(hf_config, rank_info, infer_conf)
-        self.quantization_config = getattr(hf_config, "quantization_config", {})
-        self.quant_method = self.quantization_config.get("quant_method")
+        # FP8 quantization config (matches Slime's logic)
+        self.quantization_config = getattr(hf_config, "quantization_config", None) or {}
+        self.quant_method = self.quantization_config.get("quant_method") if self.quantization_config else None
+        # weight_block_size from quantization_config, e.g. [128, 128]
+        self.weight_block_size = self.quantization_config.get("weight_block_size") if self.quantization_config else None
         self.fp8_weight_keys = set()
         if self.quant_method:
             assert self.quant_method == "fp8", "Only fp8 quantization is supported"
-            self.quant_method = "fp8"
             self.fp8_weight_keys = {
                 "up_proj.weight",
                 "down_proj.weight",
@@ -67,7 +69,7 @@ class McoreToHFWeightConverterBailingMoe(McoreToHFWeightConverter):
                 "attention.dense.weight",
                 "attention.query_key_value.weight",
             }
-            logger.info("Model is using fp8 quantization")
+            logger.info(f"BailingMoe converter: FP8 quantization enabled, weight_block_size={self.weight_block_size}")
 
     def _fuse_qkv(self, name: str) -> bool:
         return True
@@ -81,29 +83,18 @@ class McoreToHFWeightConverterBailingMoe(McoreToHFWeightConverter):
         super_converted_params = super().convert_param(name, parameter)
         if not self.quant_method:
             return super_converted_params
+
         pair_list = []
         for param_name, param in super_converted_params:
-            apply_fp8 = False
-            scale_ue8m0 = False
-            for fp8_key in self.fp8_weight_keys:
-                # ue8m0 scale：
-                # 1. attention.dense.weight
-                # 2. up, gate in MoE(Note: dense MLP and shared_expert don't use ue8m0)
-                if fp8_key in param_name:
-                    apply_fp8 = True
-                    if fp8_key == "attention.dense.weight":
-                        scale_ue8m0 = True
-                    if (
-                        ".experts." in param_name
-                        and "_proj.weight" in fp8_key
-                        and "down_proj" not in fp8_key
-                    ):
-                        scale_ue8m0 = True
-                    break
+            apply_fp8 = any(fp8_key in param_name for fp8_key in self.fp8_weight_keys)
+
             if apply_fp8:
-                qw, scale = per_block_cast_to_fp8(param, scale_ue8m0)
-                pair_list.append((param_name, qw))
-                pair_list.append((f"{param_name}_scale_inv", scale))
+                # Use Slime-compatible quantize_weight function
+                # UE8M0 decision is made by should_use_ue8m0() based on SGLang config
+                quantized_pairs = quantize_weight(
+                    param_name, param, self.weight_block_size
+                )
+                pair_list.extend(quantized_pairs)
             else:
                 pair_list.append((param_name, param))
         return pair_list

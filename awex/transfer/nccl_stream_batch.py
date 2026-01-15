@@ -65,6 +65,10 @@ class NcclColocateStreamBatchTransport:
     ):
         logger.info("Using RECURSIVE PARTITION batch_isend_irecv with O(log N) rounds")
         task_id = f"{rank_coordinate}-{step_id}"
+        # [VERIFY] Log send_parameters summary for P2P correctness verification
+        for name in list(send_parameters.keys())[:3]:
+            t = send_parameters[name]
+            logger.info(f"[P2P_SEND] rank={rank_coordinate} {name}: shape={t.shape} mean={t.float().mean():.6f} sum={t.float().sum():.6f}")
         validate_rank_mappings(
             train_to_infer_device_mapping, infer_to_train_device_mapping
         )
@@ -97,6 +101,14 @@ class NcclColocateStreamBatchTransport:
                     tensor_sliced = slice_tensor(
                         send_tensor, op, True, slice_context=train_slice_context
                     )
+                    # [VERIFY] Log self-copy send details for qkv_proj
+                    if "qkv_proj" in op.send_shard_meta.name and "layers.0." in op.send_shard_meta.name:
+                        logger.info(
+                            f"[SELF_COPY_SEND] rank={rank_coordinate} {op.send_shard_meta.name}: "
+                            f"original={send_tensor.shape} sliced={tensor_sliced.shape} "
+                            f"sliced_sum={tensor_sliced.float().sum():.6f} "
+                            f"train_slices={op.train_slices}"
+                        )
                     tensors_to_copy.append(tensor_sliced)
             else:
                 # P2P send operations
@@ -106,6 +118,20 @@ class NcclColocateStreamBatchTransport:
                     tensor_sliced = slice_tensor(
                         send_tensor, op, True, slice_context=train_slice_context
                     )
+                    # [VERIFY] Log sliced tensor for P2P correctness verification
+                    param_name = op.send_shard_meta.name
+                    should_log = (
+                        "embed_tokens" in param_name or
+                        "qkv_proj" in param_name or
+                        ("experts" in param_name and "layers.0." in param_name and ".0.gate_up" in param_name)
+                    )
+                    if should_log:
+                        logger.info(
+                            f"[SLICE_SEND] rank={rank_coordinate} {param_name}: "
+                            f"original={send_tensor.shape} sliced={tensor_sliced.shape} "
+                            f"sliced_sum={tensor_sliced.float().sum():.6f} sliced_mean={tensor_sliced.float().mean():.6f} "
+                            f"send_offset={op.send_offset} recv_rank={op.recv_rank} recv_offset={op.recv_offset}"
+                        )
                     # Use mapped inference rank for P2P operation
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
@@ -120,6 +146,8 @@ class NcclColocateStreamBatchTransport:
                 all_send_p2p_ops[mapped_peer_rank] = p2p_ops
 
         # Process recv operations
+        # [DIFF_CHECK] Save old values before P2P recv to detect incorrect transfers
+        recv_old_stats = {}  # (param_name, peer_rank, op_idx) -> (old_sum, old_mean, tensor_sliced, recv_offset)
         for send_rank, ops in recv_ops.items():
             recv_from_rank = train_to_infer_device_mapping[send_rank]
             if recv_from_rank == transfer_rank:
@@ -129,6 +157,22 @@ class NcclColocateStreamBatchTransport:
             for op in ops:
                 recv_tensor = recv_parameters[op.recv_shard_meta.name]
                 tensor_sliced = slice_tensor(recv_tensor, op, False)
+                # [DIFF_CHECK] Save old value stats before recv overwrites it
+                param_name = op.recv_shard_meta.name
+                should_track = (
+                    "embed_tokens" in param_name or
+                    "lm_head" in param_name or
+                    "qkv_proj" in param_name or
+                    ("experts" in param_name and "layers.0." in param_name) or
+                    "layers.0.mlp" in param_name or
+                    "input_layernorm" in param_name
+                )
+                if should_track:
+                    old_sum = tensor_sliced.float().sum().item()
+                    old_mean = tensor_sliced.float().mean().item()
+                    recv_old_stats[(param_name, recv_from_rank, len(p2p_ops))] = (
+                        old_sum, old_mean, tensor_sliced, op.recv_offset
+                    )
                 p2p_op = dist.P2POp(
                     dist.irecv if async_op else dist.recv,
                     tensor_sliced,
@@ -170,6 +214,55 @@ class NcclColocateStreamBatchTransport:
         )
 
         torch.cuda.synchronize()
+
+        # [DIFF_CHECK] Compare old vs new values after P2P recv
+        # Training updates are sparse, so large differences indicate incorrect transfers
+        for (param_name, peer_rank, op_idx), (old_sum, old_mean, tensor_sliced, recv_offset) in recv_old_stats.items():
+            new_sum = tensor_sliced.float().sum().item()
+            new_mean = tensor_sliced.float().mean().item()
+            diff_sum = abs(new_sum - old_sum)
+            diff_mean = abs(new_mean - old_mean)
+            # Log with clear format for easy grep
+            # Only log experts with offset info for easier debugging
+            if "experts" in param_name and "layers.0." in param_name:
+                logger.info(
+                    f"[P2P_DIFF] {param_name} from_rank={peer_rank} recv_offset={recv_offset}: "
+                    f"old_sum={old_sum:.4f} new_sum={new_sum:.4f} diff_sum={diff_sum:.4f} | "
+                    f"old_mean={old_mean:.6f} new_mean={new_mean:.6f} diff_mean={diff_mean:.6f}"
+                )
+            else:
+                logger.info(
+                    f"[P2P_DIFF] {param_name} from_rank={peer_rank}: "
+                    f"old_sum={old_sum:.4f} new_sum={new_sum:.4f} diff_sum={diff_sum:.4f} | "
+                    f"old_mean={old_mean:.6f} new_mean={new_mean:.6f} diff_mean={diff_mean:.6f}"
+                )
+
+        # [VERIFY] Log recv_parameters summary for P2P correctness verification
+        for name in list(recv_parameters.keys())[:3]:
+            t = recv_parameters[name]
+            logger.info(f"[P2P_RECV] rank={rank_coordinate} {name}: shape={t.shape} mean={t.float().mean():.6f} sum={t.float().sum():.6f}")
+
+        # [EXPERT_RECV_SUMMARY] Summarize expert params received from each training rank
+        expert_recv_summary = {}  # peer_rank -> list of expert_ids
+        for (param_name, peer_rank, op_idx), _ in recv_old_stats.items():
+            if "experts" in param_name and "layers.0." in param_name and "gate_up_proj" in param_name:
+                import re
+                match = re.search(r'experts\.(\d+)\.', param_name)
+                if match:
+                    expert_id = int(match.group(1))
+                    if peer_rank not in expert_recv_summary:
+                        expert_recv_summary[peer_rank] = set()
+                    expert_recv_summary[peer_rank].add(expert_id)
+
+        if expert_recv_summary:
+            for peer_rank, expert_ids in sorted(expert_recv_summary.items()):
+                sorted_ids = sorted(expert_ids)
+                id_range = f"{min(sorted_ids)}-{max(sorted_ids)}" if len(sorted_ids) > 1 else str(sorted_ids[0])
+                logger.info(
+                    f"[EXPERT_RECV_SUMMARY] rank={rank_coordinate} received "
+                    f"experts[{id_range}] ({len(sorted_ids)} experts) from train_rank={peer_rank}"
+                )
+
         future.set_result(True)
         duration = time.time() - start_time
         logger.info(

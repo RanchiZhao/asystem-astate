@@ -224,7 +224,16 @@ class McoreToHFWeightConverter:
             else:
                 # mlp.experts.linear_fc1.weight0
                 local_expert_id = int(name.rsplit("weight", 1)[-1])
-            num_experts = self.hf_config.num_experts
+            # Support both num_experts (Qwen) and n_routed_experts (DeepSeek-V3)
+            num_experts = getattr(
+                self.hf_config, "num_experts",
+                getattr(self.hf_config, "n_routed_experts", None)
+            )
+            if num_experts is None:
+                raise ValueError(
+                    f"Cannot determine num_experts from config. "
+                    f"Expected 'num_experts' or 'n_routed_experts' attribute."
+                )
             num_experts_per_partition = num_experts // self.rank_info.ep_size
             expert_id = (
                 local_expert_id + self.rank_info.ep_rank * num_experts_per_partition
@@ -366,7 +375,9 @@ def transform_mcore_qkv_weight(weight: torch.Tensor):
     hidden_size = args.hidden_size
     total_num_heads = args.num_attention_heads
     total_num_kv_heads = args.num_query_groups
-    head_size = divide(hidden_size, total_num_heads)
+    # Use kv_channels if available (e.g., Qwen3 sets kv_channels=128)
+    # Otherwise fallback to hidden_size / num_heads
+    head_size = getattr(args, 'kv_channels', None) or divide(hidden_size, total_num_heads)
 
     each_kv_size = head_size
     each_query_size = head_size * divide(total_num_heads, total_num_kv_heads)
@@ -374,12 +385,14 @@ def transform_mcore_qkv_weight(weight: torch.Tensor):
     # Check if weights are in replicated format or compact GQA format
     actual_size = weight.shape[0]
     expected_compact_size = (each_query_size + 2 * each_kv_size) * total_num_kv_heads
-    expected_replicated_size = 3 * hidden_size  # Q, K, V all have full hidden_size
+    # In replicated format, Q, K, V each have size = total_num_heads * head_size
+    full_qkv_dim = total_num_heads * head_size
+    expected_replicated_size = 3 * full_qkv_dim
 
     if actual_size == expected_replicated_size:
         # Replicated format: K and V are replicated to match query heads
-        # Split into Q, K, V where each has size hidden_size
-        q, k, v = weight.split([hidden_size, hidden_size, hidden_size], dim=0)
+        # Split into Q, K, V where each has size = total_num_heads * head_size
+        q, k, v = weight.split([full_qkv_dim, full_qkv_dim, full_qkv_dim], dim=0)
 
         # De-duplicate K and V by selecting only the unique KV groups
         # K and V are replicated such that each KV group appears (total_num_heads / total_num_kv_heads) times

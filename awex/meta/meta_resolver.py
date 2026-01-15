@@ -157,7 +157,9 @@ class ParamMetaResolver(ABC):
                             f"{replica_idx} {len(shard_list)}"
                         )
                         replica.append(shard_list[replica_idx])
-                    replica.sort(key=lambda x: x.tp_rank)
+                    # Sort by the appropriate rank key for this sharding type
+                    # This ensures global_offset is computed correctly
+                    replica.sort(key=lambda x: getattr(x, rank_key))
                     replica_groups.append(replica)
                 replicas[name] = replica_groups
         params_meta = []
@@ -186,6 +188,14 @@ class ParamMetaResolver(ABC):
                             prev_offsets[i] += shard.shape[i]
                         else:
                             prev_offsets[i] = shard.global_offset[i]
+                # [VERIFY] Log shard meta for correctness verification
+                if "embed_tokens" in name or "qkv_proj" in name or ("experts" in name and "layers.0." in name):
+                    for shard in replica:
+                        logger.info(
+                            f"[SHARD_META] {name}: tp_rank={shard.tp_rank} ep_rank={shard.ep_rank} "
+                            f"global_rank={shard.global_rank} "
+                            f"global_offset={shard.global_offset} shape={shard.shape}"
+                        )
             param_meta = ParameterMeta(
                 name=name,
                 global_numel=global_numel,

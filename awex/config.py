@@ -77,6 +77,10 @@ class InferenceConfig:
     # the ipc backend of weights exchange, can be "cpu" or "cuda"
     weights_exchange_ipc_backend: str = "cuda"
     weights_comm_nccl_group_size: int = 1
+    # In cross-node colocate mode, each engine independently handles weight updates
+    # because execute_task_in_model_worker cannot broadcast across nodes.
+    # When True, all engines (not just node_rank=0) initialize WeightsReader.
+    awex_per_node_mode: bool = False
 
     @staticmethod
     def from_dict(config_dict: Dict[str, Any]) -> "InferenceConfig":

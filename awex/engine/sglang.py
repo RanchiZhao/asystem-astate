@@ -40,6 +40,17 @@ class SGLangEngine(InferenceEngine):
         self.rank_coordinate = f"{config.engine_rank}-{self.node_rank}"
         self._initialized = False
 
+        # In cross-node colocate mode, each engine independently handles weight updates
+        # because execute_task_in_model_worker cannot broadcast across nodes.
+        # When awex_per_node_mode is True, all engines (not just node_rank=0) initialize
+        # WeightsReader and handle weight updates for their local 8 GPUs.
+        self._awex_per_node_mode = getattr(config, 'awex_per_node_mode', False)
+        if self._awex_per_node_mode:
+            logger.info(
+                f"[SGLangEngine] {self.rank_coordinate}: Per-node mode enabled - "
+                f"this engine will independently handle weight updates"
+            )
+
     @property
     def engine_name(self):
         return "sglang"
@@ -49,13 +60,26 @@ class SGLangEngine(InferenceEngine):
         return self._config
 
     def initialize(self) -> None:
-        if self.config.node_rank == 0:
+        import time
+        # In per-node mode, all engines initialize (not just node_rank=0)
+        # because each engine independently handles weight updates for its 8 GPUs.
+        should_initialize = self._awex_per_node_mode or self.config.node_rank == 0
+
+        if should_initialize:
             logger.info(
-                f"Start to initialize weights exchange reader for {self.rank_coordinate}"
+                f"Start to initialize weights exchange reader for {self.rank_coordinate} "
+                f"(per_node_mode={self._awex_per_node_mode})"
             )
             self._initialized = True
+            t0 = time.time()
+            logger.info(f"[PROFILE] {self.rank_coordinate} Calling get_weights_exchange_reader...")
             self.weights_exchange_reader = get_weights_exchange_reader(self)
+            t1 = time.time()
+            logger.info(f"[PROFILE] {self.rank_coordinate} get_weights_exchange_reader took {t1-t0:.2f}s")
+            logger.info(f"[PROFILE] {self.rank_coordinate} Calling weights_exchange_reader.initialize()...")
             self.weights_exchange_reader.initialize()
+            t2 = time.time()
+            logger.info(f"[PROFILE] {self.rank_coordinate} initialize() took {t2-t1:.2f}s")
             logger.info(
                 f"Finished initializing weights exchange reader for {self.rank_coordinate}"
             )
@@ -86,14 +110,30 @@ class SGLangEngine(InferenceEngine):
         )
 
     def update_weights(self, **kwargs):
+        # Use step_id from kwargs if provided, otherwise fallback to global_step
+        step_id = kwargs.pop('step_id', self.global_step)
+
+        # In per-node mode, all engines execute update_weights (not just node_rank=0)
+        # because each engine independently handles weight updates for its 8 GPUs.
+        # In standard mode, only node_rank=0 workers have initialized weights_exchange_reader
+        # Other workers skip the update (they participate via execute_task_in_model_worker)
+        should_update = self._awex_per_node_mode or self.node_rank == 0
+
+        if not should_update:
+            logger.info(
+                f"Non-zero rank node {self.rank_coordinate}, skipping update_weights"
+            )
+            return
+
         logger.info(
-            f"Start to update weights for step {self.global_step} for {self.rank_coordinate}"
+            f"Start to update weights for step {step_id} for {self.rank_coordinate} "
+            f"(per_node_mode={self._awex_per_node_mode})"
         )
         start_time = time.time()
-        self.weights_exchange_reader.update_weights(step_id=self.global_step, **kwargs)
+        self.weights_exchange_reader.update_weights(step_id=step_id, **kwargs)
         duration = time.time() - start_time
         logger.info(
-            f"Finished updating weights for step {self.global_step} for {self.rank_coordinate}, "
+            f"Finished updating weights for step {step_id} for {self.rank_coordinate}, "
             f"took {duration:.3f} seconds"
         )
 
@@ -101,7 +141,9 @@ class SGLangEngine(InferenceEngine):
         tags = tags or ["kv_cache", "weights"]
         if isinstance(tags, str):
             tags = [tags]
-        if self._initialized and self.node_rank == 0:
+        # In per-node mode, all engines can release memory (not just node_rank=0)
+        should_release = self._awex_per_node_mode or self.node_rank == 0
+        if self._initialized and should_release:
             logger.info(
                 f"Release memory occupation {tags}, released_tags {self.released_tags}"
             )
@@ -124,7 +166,9 @@ class SGLangEngine(InferenceEngine):
         tags = tags or ["kv_cache", "weights"]
         if isinstance(tags, str):
             tags = [tags]
-        if self._initialized and self.node_rank == 0:
+        # In per-node mode, all engines can resume memory (not just node_rank=0)
+        should_resume = self._awex_per_node_mode or self.node_rank == 0
+        if self._initialized and should_resume:
             logger.info(
                 f"Resume memory occupation {tags}, released_tags {self.released_tags}"
             )
@@ -142,7 +186,9 @@ class SGLangEngine(InferenceEngine):
     def execute_task_in_model_worker(self, fn, **kwargs):
         if not self._initialized:
             raise RuntimeError("Engine not initialized. Call `initialize` first.")
-        if self.node_rank != 0:
+        # In per-node mode, all engines can execute tasks (not just node_rank=0)
+        should_execute = self._awex_per_node_mode or self.node_rank == 0
+        if not should_execute:
             raise RuntimeError(
                 f"Non-zero rank node {self.rank_coordinate} is not allowed to "
                 f"execute task in model workers"

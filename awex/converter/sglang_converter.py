@@ -35,9 +35,14 @@ class SGlangToHFWeightConverter:
         self.total_kv_heads = model_config.num_key_value_heads
         self.infer_engine_config = infer_engine_config
         self.rank_info = rank_info
-        self.tp_size = infer_engine_config.tp_size
+        # Handle both dict and object access for infer_engine_config
+        if isinstance(infer_engine_config, dict):
+            self.tp_size = infer_engine_config.get("tp_size", 1)
+            self.ep_size = infer_engine_config.get("ep_size", 1)
+        else:
+            self.tp_size = infer_engine_config.tp_size
+            self.ep_size = infer_engine_config.ep_size
         self.tp_rank = self.rank_info.tp_rank
-        self.ep_size = infer_engine_config.ep_size
         self.ep_rank = self.rank_info.ep_rank
 
     def _fuse_qkv(self, name: str) -> bool:
@@ -90,6 +95,20 @@ class SGlangToHFWeightConverter:
                     ),
                 ]
         elif "o_proj" in name or "dense" in name:
+            return [(name, parameter)]
+        # DeepSeek-V3 MLA (Multi-head Latent Attention) parameters
+        # These are used in the low-rank attention mechanism
+        elif "fused_qkv_a_proj_with_mqa" in name:
+            # Fused Q/K/V projection for MLA - keep as is
+            return [(name, parameter)]
+        elif "q_a_proj" in name or "kv_a_proj" in name:
+            # Separate Q and KV projections for MLA
+            return [(name, parameter)]
+        elif "q_b_proj" in name or "kv_b_proj" in name:
+            # B projections for MLA
+            return [(name, parameter)]
+        elif "q_a_layernorm" in name or "kv_a_layernorm" in name:
+            # Layer norms for MLA
             return [(name, parameter)]
         else:
             raise NotImplementedError(f"Unsupported attention parameter name: {name}")
@@ -208,6 +227,9 @@ class SGlangToHFWeightConverter:
         # w2_weight shape: num_experts_per_partition, hidden_size, intermediate_size
         if "expert_bias" in name:
             return [(name, parameter)]
+        # Handle shared_experts separately - they are not partitioned like regular experts
+        if "shared_experts" in name:
+            return self._convert_mlp_param(name, parameter, layer_number)
         converted_params = []
         num_local_experts = parameter.shape[0]
         for i in range(num_local_experts):
@@ -248,6 +270,16 @@ class SGlangToHFWeightConverter:
         elif "query_layernorm" in name:
             return [(name, parameter)]
         elif "key_layernorm" in name:
+            return [(name, parameter)]
+        # DeepSeek-V3 MLA (Multi-head Latent Attention) layer norms
+        elif "q_a_layernorm" in name:
+            return [(name, parameter)]
+        elif "kv_a_layernorm" in name:
+            return [(name, parameter)]
+        # Qwen3 QK-LayerNorm (qk-layernorm)
+        elif "q_norm" in name:
+            return [(name, parameter)]
+        elif "k_norm" in name:
             return [(name, parameter)]
         else:
             raise NotImplementedError(f"Unsupported layer norm parameter name: {name}")
@@ -309,6 +341,11 @@ class SGlangToHFWeightConverter:
                     return [(name, parameter)]
                 elif "router.weight" in remaining_name:
                     return [(f"model.layers.{layer_idx}.mlp.gate.weight", parameter)]
+                # DeepSeek-V3 MoE router bias parameters
+                elif "gate.e_score_correction_bias" in remaining_name:
+                    return [(name, parameter)]
+                elif "e_score_correction_bias" in remaining_name:
+                    return [(name, parameter)]
 
                 # Check if this is an expert parameter
                 if ".expert" in remaining_name or "experts." in remaining_name:

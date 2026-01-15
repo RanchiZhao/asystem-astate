@@ -87,6 +87,7 @@ class TransferPlanBuilder:
         train_world_size: int,
         num_infer_engines: int = 1,
         enable_debug_mode: bool = False,
+        hf_config=None,
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
@@ -97,6 +98,7 @@ class TransferPlanBuilder:
         self.infer_instance_world_size = infer_world_size // num_infer_engines
         self.num_infer_engines = num_infer_engines
         self.enable_debug_mode = enable_debug_mode
+        self.hf_config = hf_config
         logger.info(
             f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
             f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, enable_debug_mode: {enable_debug_mode}"
@@ -194,6 +196,18 @@ class TransferPlanBuilder:
         Returns:
             List of communication operations for this parameter
         """
+        # Special handling for qkv_proj with KV head replication
+        if self._is_qkv_param(param_name) and self._needs_qkv_head_mapping(inference_meta, training_meta):
+            return self._build_qkv_communication_plan(
+                param_name, inference_meta, training_meta, global_transfer_rank
+            )
+
+        # Special handling for MoE expert weights with EP→TP conversion
+        if self._is_expert_param(param_name) and self._needs_expert_mapping(inference_meta, training_meta):
+            return self._build_expert_communication_plan(
+                param_name, inference_meta, training_meta, global_transfer_rank
+            )
+
         plan = []
 
         # Get the replicas for both inference and training
@@ -452,6 +466,17 @@ class TransferPlanBuilder:
                 inf_slices=infer_slices,
             )
         )
+        # [VERIFY] Log TransferPlan operations for correctness verification
+        op = plan[-1]
+        if "embed_tokens" in train_shard_offset.shard.name or "qkv_proj" in train_shard_offset.shard.name:
+            logger.info(
+                f"[TRANSFER_OP] param={op.send_shard_meta.name} "
+                f"send_rank={op.send_rank} recv_rank={op.recv_rank} "
+                f"overlap_shape={op.overlap_shape} "
+                f"train_slices={op.train_slices} inf_slices={op.inf_slices} "
+                f"train_global_offset={train_shard_offset.shard.global_offset} "
+                f"inf_global_offset={inf_shard_offset.shard.global_offset}"
+            )
 
         return plan
 
@@ -479,6 +504,545 @@ class TransferPlanBuilder:
         for key in sorted(grouped_operations.keys()):
             sorted_grouped_operations[key] = grouped_operations[key]
         return sorted_grouped_operations
+
+    def _is_qkv_param(self, param_name: str) -> bool:
+        """Check if the parameter is a fused QKV projection."""
+        return "qkv_proj" in param_name
+
+    def _needs_qkv_head_mapping(
+        self, inference_meta: ParameterMeta, training_meta: ParameterMeta
+    ) -> bool:
+        """
+        Check if QKV parameter needs special head-level mapping.
+        This is needed when inference has KV head replication (global shapes differ).
+        """
+        if not self.hf_config:
+            return False
+
+        infer_global_shape = inference_meta.global_shape
+        train_global_shape = training_meta.global_shape
+
+        # If shapes are equal, no special handling needed
+        if infer_global_shape == train_global_shape:
+            return False
+
+        # Check if this is a GQA model with KV replication scenario
+        num_attention_heads = getattr(self.hf_config, "num_attention_heads", None)
+        num_kv_heads = getattr(self.hf_config, "num_key_value_heads", None) or getattr(
+            self.hf_config, "num_query_groups", num_attention_heads
+        )
+
+        if num_kv_heads is None or num_attention_heads is None:
+            return False
+
+        # Need special handling if inference TP > num_kv_heads (causes KV replication)
+        infer_tp_size = self.infer_instance_world_size
+        if infer_tp_size > num_kv_heads:
+            logger.info(
+                f"QKV head mapping enabled: infer_tp={infer_tp_size} > num_kv_heads={num_kv_heads}, "
+                f"train_shape={train_global_shape}, infer_shape={infer_global_shape}"
+            )
+            return True
+
+        return False
+
+    def _build_qkv_communication_plan(
+        self,
+        param_name: str,
+        inference_meta: ParameterMeta,
+        training_meta: ParameterMeta,
+        global_transfer_rank: int = None,
+    ) -> List[CommunicationOperation]:
+        """
+        Build communication plan for QKV projection with head-level mapping.
+
+        This handles the case where inference has KV head replication:
+        - Training: [Q|K|V] with unique K/V data
+        - Inference: [Q|K|V] with replicated K/V data
+
+        For example (training TP=4, inference TP=8, num_kv_heads=4):
+        - Training rank 0: Q heads 0-7, K head 0, V head 0 (1280 elements)
+        - Inference rank 0: Q heads 0-3, K head 0, V head 0 (768 elements)
+        - Inference rank 1: Q heads 4-7, K head 0, V head 0 (768 elements)
+
+        Train rank 0's K/V should be sent to BOTH inference ranks 0 and 1 (fan-out).
+        """
+        plan = []
+
+        # Get model config
+        num_q_heads = getattr(self.hf_config, "num_attention_heads", 32)
+        num_kv_heads = getattr(self.hf_config, "num_key_value_heads", None) or getattr(
+            self.hf_config, "num_query_groups", num_q_heads
+        )
+        head_dim = getattr(self.hf_config, "head_dim", None) or getattr(
+            self.hf_config, "kv_channels", None
+        )
+        if head_dim is None:
+            hidden_size = getattr(self.hf_config, "hidden_size", 2048)
+            head_dim = hidden_size // num_q_heads
+
+        # Compute TP sizes from world sizes
+        # In colocate mode, training and inference share GPUs
+        # Training world size includes DP replicas, so we need to infer TP from shards
+        train_tp_size = len(training_meta.replicas[0].shards) if training_meta.replicas else 1
+        infer_tp_size = self.infer_instance_world_size
+
+        # For DP training, we only use one replica (DP replicas have same data)
+        training_replica = training_meta.replicas[0]
+
+        # KV replication factor
+        kv_replicas = max(1, infer_tp_size // num_kv_heads)
+
+        logger.info(
+            f"QKV head mapping for {param_name}: num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim}, train_tp={train_tp_size}, infer_tp={infer_tp_size}, kv_replicas={kv_replicas}"
+        )
+
+        # Compute per-rank head assignments
+        train_q_heads_per_rank = num_q_heads // train_tp_size
+        train_kv_heads_per_rank = num_kv_heads // train_tp_size
+        infer_q_heads_per_rank = num_q_heads // infer_tp_size
+
+        # Process each training shard
+        for train_shard in training_replica.shards:
+            train_tp_rank = train_shard.tp_rank
+            train_transfer_rank = train_shard.global_rank + self.infer_world_size
+
+            # Skip if filtering by rank and this isn't the right rank
+            if global_transfer_rank is not None and train_transfer_rank != global_transfer_rank:
+                # Also check if this rank is an inference rank that needs data from this training rank
+                if global_transfer_rank >= self.infer_world_size:
+                    continue
+
+            # Training shard layout: [Q | K | V]
+            train_q_size = train_q_heads_per_rank * head_dim
+            train_k_size = train_kv_heads_per_rank * head_dim
+            train_v_size = train_kv_heads_per_rank * head_dim
+
+            # Q head range for this training rank
+            train_q_start_head = train_tp_rank * train_q_heads_per_rank
+            train_q_end_head = train_q_start_head + train_q_heads_per_rank
+
+            # KV head range for this training rank
+            train_kv_start_head = train_tp_rank * train_kv_heads_per_rank
+            train_kv_end_head = train_kv_start_head + train_kv_heads_per_rank
+
+            # Process each inference engine
+            for engine_rank in range(self.num_infer_engines):
+                for inf_replica in inference_meta.replicas:
+                    for inf_shard in inf_replica.shards:
+                        infer_tp_rank = inf_shard.tp_rank
+                        infer_transfer_rank = inf_shard.global_rank + engine_rank * self.infer_instance_world_size
+
+                        # Skip if filtering by rank
+                        if global_transfer_rank is not None:
+                            if global_transfer_rank < self.infer_world_size:
+                                # Inference rank: only include ops where this rank is receiver
+                                if infer_transfer_rank != global_transfer_rank:
+                                    continue
+                            else:
+                                # Training rank: only include ops where this rank is sender
+                                if train_transfer_rank != global_transfer_rank:
+                                    continue
+
+                        # Inference shard layout: [Q | K | V]
+                        infer_q_size = infer_q_heads_per_rank * head_dim
+                        infer_k_size = head_dim  # 1 KV head per rank (replicated)
+                        infer_v_size = head_dim
+
+                        # Q head range for this inference rank
+                        infer_q_start_head = infer_tp_rank * infer_q_heads_per_rank
+                        infer_q_end_head = infer_q_start_head + infer_q_heads_per_rank
+
+                        # KV head for this inference rank (with replication)
+                        infer_kv_head = infer_tp_rank // kv_replicas
+
+                        # === Q transfer ===
+                        # Find overlap between training Q heads and inference Q heads
+                        q_overlap_start = max(train_q_start_head, infer_q_start_head)
+                        q_overlap_end = min(train_q_end_head, infer_q_end_head)
+
+                        if q_overlap_start < q_overlap_end:
+                            num_overlap_q_heads = q_overlap_end - q_overlap_start
+                            overlap_q_size = num_overlap_q_heads * head_dim
+
+                            # Training offset: relative to Q start in training shard
+                            train_q_offset = (q_overlap_start - train_q_start_head) * head_dim
+                            # Inference offset: relative to Q start in inference shard
+                            infer_q_offset = (q_overlap_start - infer_q_start_head) * head_dim
+
+                            hidden_dim = train_shard.shape[1] if len(train_shard.shape) > 1 else 1
+
+                            plan.append(
+                                CommunicationOperation(
+                                    send_rank=train_transfer_rank,
+                                    send_shard_meta=train_shard,
+                                    send_offset=(train_q_offset, 0),
+                                    recv_rank=infer_transfer_rank,
+                                    recv_shard_meta=inf_shard,
+                                    recv_offset=(infer_q_offset, 0),
+                                    overlap_shape=(overlap_q_size, hidden_dim),
+                                    train_slices=(slice(train_q_offset, train_q_offset + overlap_q_size), slice(0, hidden_dim)),
+                                    inf_slices=(slice(infer_q_offset, infer_q_offset + overlap_q_size), slice(0, hidden_dim)),
+                                )
+                            )
+
+                        # === K transfer (with fan-out for replication) ===
+                        # Check if this inference rank needs K data from this training rank
+                        if train_kv_start_head <= infer_kv_head < train_kv_end_head:
+                            # Training K offset: relative to K start in training shard
+                            train_k_local_idx = infer_kv_head - train_kv_start_head
+                            train_k_offset = train_q_size + train_k_local_idx * head_dim
+                            # Inference K offset: relative to start of inference shard
+                            infer_k_offset = infer_q_size
+
+                            hidden_dim = train_shard.shape[1] if len(train_shard.shape) > 1 else 1
+
+                            plan.append(
+                                CommunicationOperation(
+                                    send_rank=train_transfer_rank,
+                                    send_shard_meta=train_shard,
+                                    send_offset=(train_k_offset, 0),
+                                    recv_rank=infer_transfer_rank,
+                                    recv_shard_meta=inf_shard,
+                                    recv_offset=(infer_k_offset, 0),
+                                    overlap_shape=(head_dim, hidden_dim),
+                                    train_slices=(slice(train_k_offset, train_k_offset + head_dim), slice(0, hidden_dim)),
+                                    inf_slices=(slice(infer_k_offset, infer_k_offset + head_dim), slice(0, hidden_dim)),
+                                )
+                            )
+
+                        # === V transfer (with fan-out for replication) ===
+                        # Check if this inference rank needs V data from this training rank
+                        if train_kv_start_head <= infer_kv_head < train_kv_end_head:
+                            # Training V offset
+                            train_v_local_idx = infer_kv_head - train_kv_start_head
+                            train_v_offset = train_q_size + train_k_size + train_v_local_idx * head_dim
+                            # Inference V offset
+                            infer_v_offset = infer_q_size + infer_k_size
+
+                            hidden_dim = train_shard.shape[1] if len(train_shard.shape) > 1 else 1
+
+                            plan.append(
+                                CommunicationOperation(
+                                    send_rank=train_transfer_rank,
+                                    send_shard_meta=train_shard,
+                                    send_offset=(train_v_offset, 0),
+                                    recv_rank=infer_transfer_rank,
+                                    recv_shard_meta=inf_shard,
+                                    recv_offset=(infer_v_offset, 0),
+                                    overlap_shape=(head_dim, hidden_dim),
+                                    train_slices=(slice(train_v_offset, train_v_offset + head_dim), slice(0, hidden_dim)),
+                                    inf_slices=(slice(infer_v_offset, infer_v_offset + head_dim), slice(0, hidden_dim)),
+                                )
+                            )
+
+        logger.info(f"QKV head mapping generated {len(plan)} operations for {param_name}")
+        return plan
+
+    def _is_expert_param(self, param_name: str) -> bool:
+        """Check if the parameter is an MoE expert parameter."""
+        # Detect expert params like: mlp.experts.0.gate_up_proj.weight, mlp.experts.0.down_proj.weight
+        # But not shared_experts or router/gate
+        if "shared_experts" in param_name:
+            return False
+        if "expert_bias" in param_name or "gate.weight" in param_name or "router" in param_name:
+            return False
+        return "experts." in param_name
+
+    def _needs_expert_mapping(
+        self, inference_meta: ParameterMeta, training_meta: ParameterMeta
+    ) -> bool:
+        """
+        Check if expert parameter needs special EP→TP mapping.
+        This is needed when training uses EP sharding (experts split by expert_id)
+        but inference uses TP sharding (experts split by intermediate dimension).
+        """
+        if not self.hf_config:
+            return False
+
+        # Get sharding info from the first replica's first shard
+        if not training_meta.replicas or not inference_meta.replicas:
+            return False
+
+        train_first_shard = training_meta.replicas[0].shards[0]
+        infer_first_shard = inference_meta.replicas[0].shards[0]
+
+        # Check if training uses EP sharding and inference uses TP sharding
+        from awex.sharding.param_sharding import ShardingType
+        train_sharding = train_first_shard.sharding_type
+        infer_sharding = infer_first_shard.sharding_type
+
+        # Need special handling when:
+        # - Training has EP_SHARDING (experts split by expert_id across EP ranks)
+        # - Inference has TP_SHARDING (experts split by intermediate dimension)
+        needs_mapping = (
+            train_sharding == ShardingType.EP_SHARDING and
+            infer_sharding == ShardingType.TP_SHARDING
+        )
+
+        if needs_mapping:
+            logger.info(
+                f"Expert EP→TP mapping enabled for {training_meta.name}: "
+                f"train_sharding={train_sharding}, infer_sharding={infer_sharding}, "
+                f"train_shape={training_meta.global_shape}, infer_shape={inference_meta.global_shape}"
+            )
+
+        return needs_mapping
+
+    def _build_expert_communication_plan(
+        self,
+        param_name: str,
+        inference_meta: ParameterMeta,
+        training_meta: ParameterMeta,
+        global_transfer_rank: int = None,
+    ) -> List[CommunicationOperation]:
+        """
+        Build communication plan for MoE expert weights with EP→TP conversion.
+
+        This handles the case where:
+        - Training: EP sharding (each GPU has N/EP_size complete experts)
+        - Inference: TP sharding (each GPU has all N experts but only 1/TP_size of intermediate dim)
+
+        For example (training EP=8, inference TP=8, num_experts=128):
+        - Training rank 0: experts 0-15, complete intermediate_size (1536)
+        - Inference rank 0: all 128 experts, intermediate_size[0:192]
+        - Inference rank 1: all 128 experts, intermediate_size[192:384]
+        ...
+
+        Each training rank sends slices to ALL inference ranks.
+        """
+        plan = []
+
+        # Determine expert intermediate_size from the shape
+        # Training shape: (intermediate_size, hidden_size) for gate_up_proj
+        # or (hidden_size, intermediate_size) for down_proj
+        train_first_shard = training_meta.replicas[0].shards[0]
+        infer_first_shard = inference_meta.replicas[0].shards[0]
+
+        # Infer dimensions from actual shapes
+        train_shape = train_first_shard.shape  # e.g., (1536, 2048) for gate_up_proj
+        infer_shape = infer_first_shard.shape  # e.g., (192, 2048) for gate_up_proj
+
+        # Get sharding dimension (0 for gate_up_proj, 1 for down_proj)
+        sharding_dim = infer_first_shard.sharding_dim
+
+        # Compute TP/EP sizes
+        infer_tp_size = self.infer_instance_world_size
+
+        # Size of each slice for inference
+        full_dim_size = train_shape[sharding_dim]  # Complete dimension on training side
+        slice_size = full_dim_size // infer_tp_size
+
+        hidden_dim = train_shape[1 - sharding_dim] if len(train_shape) > 1 else 1
+
+        # Get the absolute expert ID from the parameter name
+        # e.g., "mlp.experts.15.gate_up_proj.weight" -> expert_id = 15
+        expert_id = self._extract_expert_id(param_name)
+        if expert_id is None:
+            logger.warning(f"Could not extract expert_id from {param_name}")
+            return []
+
+        is_gate_up_param = "gate_up_proj" in param_name and sharding_dim == 0
+        logger.info(
+            f"Expert EP→TP mapping for {param_name}: expert_id={expert_id}, "
+            f"infer_tp_size={infer_tp_size}, "
+            f"full_dim={full_dim_size}, slice_size={slice_size}, sharding_dim={sharding_dim}, "
+            f"is_gate_up={is_gate_up_param}, "
+            f"train_replicas={len(training_meta.replicas)}, infer_replicas={len(inference_meta.replicas)}, "
+            f"train_shards_per_replica={[len(r.shards) for r in training_meta.replicas]}, "
+            f"infer_shards_per_replica={[len(r.shards) for r in inference_meta.replicas]}, "
+            f"train_shape={train_shape}, infer_shape={infer_shape}"
+        )
+
+        # Process each training replica
+        # For EP_SHARDING, each expert param should have exactly 1 training shard
+        for train_replica in training_meta.replicas:
+            for train_shard in train_replica.shards:
+                train_transfer_rank = train_shard.global_rank + self.infer_world_size
+
+                # Skip if filtering by rank and this isn't the right rank
+                if global_transfer_rank is not None and global_transfer_rank >= self.infer_world_size:
+                    if train_transfer_rank != global_transfer_rank:
+                        continue
+
+                # For each inference rank, send the corresponding slice
+                for engine_rank in range(self.num_infer_engines):
+                    for inf_replica in inference_meta.replicas:
+                        # [DEBUG] Log shard details for first expert
+                        if expert_id == 0 and "gate_up_proj" in param_name and "layers.0." in param_name:
+                            shard_details = [(s.tp_rank, s.global_rank) for s in inf_replica.shards]
+                            logger.info(
+                                f"[EXPERT_SHARD_DEBUG] {param_name}: "
+                                f"global_transfer_rank={global_transfer_rank}, "
+                                f"infer_world_size={self.infer_world_size}, "
+                                f"shard_details (tp_rank, global_rank)={shard_details}"
+                            )
+                        for inf_shard in inf_replica.shards:
+                            infer_tp_rank = inf_shard.tp_rank
+                            infer_transfer_rank = inf_shard.global_rank + engine_rank * self.infer_instance_world_size
+
+                            # Skip if filtering by rank
+                            if global_transfer_rank is not None:
+                                if global_transfer_rank < self.infer_world_size:
+                                    # Inference rank: only include ops where this rank is receiver
+                                    if infer_transfer_rank != global_transfer_rank:
+                                        continue
+                                else:
+                                    # Training rank: already filtered above
+                                    pass
+
+                            # Check if this is a gate_up_proj (fused gate+up with gated linear unit)
+                            # For gate_up_proj:
+                            #   Megatron layout: [Gate_all | Up_all] contiguous
+                            #   SGLang layout: [Gate_slice | Up_slice] per TP rank
+                            # Need to split into TWO transfers
+                            is_gate_up = "gate_up_proj" in param_name and sharding_dim == 0
+
+                            if is_gate_up:
+                                # For gate_up_proj, need to send Gate and Up slices separately
+                                # full_dim_size = 2 * intermediate_size (gate + up)
+                                # half_dim = intermediate_size (gate only or up only)
+                                # slice_size = full_dim_size / infer_tp_size = 2 * half_dim / TP
+                                # half_slice = slice_size / 2 = half_dim / TP
+                                half_dim = full_dim_size // 2  # e.g., 768
+                                half_slice = slice_size // 2   # e.g., 96
+
+                                # Gate slice: train[r*half_slice : (r+1)*half_slice] -> infer[0:half_slice]
+                                gate_train_start = infer_tp_rank * half_slice
+                                gate_train_end = gate_train_start + half_slice
+                                gate_infer_start = 0
+                                gate_infer_end = half_slice
+
+                                plan.append(
+                                    CommunicationOperation(
+                                        send_rank=train_transfer_rank,
+                                        send_shard_meta=train_shard,
+                                        send_offset=(gate_train_start, 0),
+                                        recv_rank=infer_transfer_rank,
+                                        recv_shard_meta=inf_shard,
+                                        recv_offset=(gate_infer_start, 0),
+                                        overlap_shape=(half_slice, hidden_dim),
+                                        train_slices=(slice(gate_train_start, gate_train_end), slice(0, hidden_dim)),
+                                        inf_slices=(slice(gate_infer_start, gate_infer_end), slice(0, hidden_dim)),
+                                    )
+                                )
+
+                                # Up slice: train[half_dim + r*half_slice : half_dim + (r+1)*half_slice] -> infer[half_slice:slice_size]
+                                up_train_start = half_dim + infer_tp_rank * half_slice
+                                up_train_end = up_train_start + half_slice
+                                up_infer_start = half_slice
+                                up_infer_end = slice_size
+
+                                plan.append(
+                                    CommunicationOperation(
+                                        send_rank=train_transfer_rank,
+                                        send_shard_meta=train_shard,
+                                        send_offset=(up_train_start, 0),
+                                        recv_rank=infer_transfer_rank,
+                                        recv_shard_meta=inf_shard,
+                                        recv_offset=(up_infer_start, 0),
+                                        overlap_shape=(half_slice, hidden_dim),
+                                        train_slices=(slice(up_train_start, up_train_end), slice(0, hidden_dim)),
+                                        inf_slices=(slice(up_infer_start, up_infer_end), slice(0, hidden_dim)),
+                                    )
+                                )
+
+                                # Log gate_up split for debugging
+                                if len(plan) <= 6 or "layers.0." in param_name:
+                                    logger.debug(
+                                        f"[EXPERT_GATE_UP_SPLIT] {param_name}: "
+                                        f"half_dim={half_dim}, half_slice={half_slice}, "
+                                        f"gate: train[{gate_train_start}:{gate_train_end}] -> infer[{gate_infer_start}:{gate_infer_end}], "
+                                        f"up: train[{up_train_start}:{up_train_end}] -> infer[{up_infer_start}:{up_infer_end}]"
+                                    )
+                            else:
+                                # For down_proj or non-gated params: simple contiguous slice
+                                # Calculate slice offsets
+                                # Training: send slice [tp_rank * slice_size : (tp_rank + 1) * slice_size]
+                                train_slice_start = infer_tp_rank * slice_size
+                                train_slice_end = train_slice_start + slice_size
+
+                                # Inference: receive at [0 : slice_size] (the full shard)
+                                infer_slice_start = 0
+                                infer_slice_end = slice_size
+
+                                # Build slices based on sharding dimension
+                                if sharding_dim == 0:
+                                    # Non-gated column parallel: shape (intermediate_size, hidden_size)
+                                    train_slices = (slice(train_slice_start, train_slice_end), slice(0, hidden_dim))
+                                    inf_slices = (slice(infer_slice_start, infer_slice_end), slice(0, hidden_dim))
+                                    overlap_shape = (slice_size, hidden_dim)
+                                    train_offset = (train_slice_start, 0)
+                                    infer_offset = (infer_slice_start, 0)
+                                else:
+                                    # down_proj: shape (hidden_size, intermediate_size)
+                                    train_slices = (slice(0, hidden_dim), slice(train_slice_start, train_slice_end))
+                                    inf_slices = (slice(0, hidden_dim), slice(infer_slice_start, infer_slice_end))
+                                    overlap_shape = (hidden_dim, slice_size)
+                                    train_offset = (0, train_slice_start)
+                                    infer_offset = (0, infer_slice_start)
+
+                                plan.append(
+                                    CommunicationOperation(
+                                        send_rank=train_transfer_rank,
+                                        send_shard_meta=train_shard,
+                                        send_offset=train_offset,
+                                        recv_rank=infer_transfer_rank,
+                                        recv_shard_meta=inf_shard,
+                                        recv_offset=infer_offset,
+                                        overlap_shape=overlap_shape,
+                                        train_slices=train_slices,
+                                        inf_slices=inf_slices,
+                                    )
+                                )
+
+                                # Log for down_proj debugging
+                                if len(plan) <= 3 or "layers.0." in param_name:
+                                    logger.debug(
+                                        f"[EXPERT_OP] {param_name}: "
+                                        f"train_rank={train_transfer_rank} (global={train_shard.global_rank}) -> "
+                                        f"infer_rank={infer_transfer_rank} (tp={infer_tp_rank}), "
+                                        f"train_slice=[{train_slice_start}:{train_slice_end}] -> "
+                                        f"infer_slice=[{infer_slice_start}:{infer_slice_end}], "
+                                        f"overlap_shape={overlap_shape}"
+                                    )
+
+        logger.info(f"Expert EP→TP mapping generated {len(plan)} operations for {param_name}")
+
+        # [EXPERT_TRANSFER_MAP] Log detailed transfer mapping for first expert of first layer
+        if "layers.0." in param_name and "gate_up_proj" in param_name and expert_id < 16:
+            # Group operations by sender rank to show all-to-all pattern
+            sender_to_receivers = {}
+            for op in plan:
+                sender = op.send_rank
+                receiver = op.recv_rank
+                if sender not in sender_to_receivers:
+                    sender_to_receivers[sender] = []
+                sender_to_receivers[sender].append({
+                    'recv_rank': receiver,
+                    'send_offset': op.send_offset,
+                    'recv_offset': op.recv_offset,
+                    'overlap_shape': op.overlap_shape,
+                })
+
+            for sender, receivers in sorted(sender_to_receivers.items()):
+                recv_ranks = sorted(set(r['recv_rank'] for r in receivers))
+                logger.info(
+                    f"[EXPERT_TRANSFER_MAP] {param_name}: "
+                    f"train_rank={sender} -> infer_ranks={recv_ranks} "
+                    f"(total {len(receivers)} ops, shape={receivers[0]['overlap_shape'] if receivers else 'N/A'})"
+                )
+
+        return plan
+
+    def _extract_expert_id(self, param_name: str) -> int:
+        """Extract expert ID from parameter name like 'mlp.experts.15.gate_up_proj.weight'."""
+        import re
+        match = re.search(r'experts\.(\d+)\.', param_name)
+        if match:
+            return int(match.group(1))
+        return None
 
     def build_local_transfer_plan(
         self,

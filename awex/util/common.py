@@ -146,10 +146,71 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
     )
 
 
+def _is_qkv_param_with_kv_replication(
+    param_name: str,
+    infer_param_meta,
+    train_param_meta,
+    hf_config=None,
+) -> bool:
+    """
+    Check if this is a qkv_proj parameter that has KV head replication.
+
+    SGLang replicates KV heads when infer_tp > num_kv_heads, causing:
+    - Training global shape: (num_q_heads + num_kv_heads*2) * head_dim
+    - Inference global shape: (num_q_heads + infer_tp*2) * head_dim  (with replicated KV)
+
+    This is expected and should not be treated as an error.
+    """
+    if "qkv_proj" not in param_name:
+        return False
+
+    if hf_config is None:
+        return False
+
+    num_kv_heads = getattr(hf_config, "num_key_value_heads", None)
+    if num_kv_heads is None:
+        return False
+
+    infer_tp_size = len(infer_param_meta.replicas[0].shards)
+
+    # KV replication happens when infer_tp > num_kv_heads
+    if infer_tp_size <= num_kv_heads:
+        return False
+
+    # Verify the shape difference matches expected KV replication
+    # Inference has extra (infer_tp - num_kv_heads) * 2 * head_dim elements per shard
+    train_global = train_param_meta.global_shape[0]
+    infer_global = infer_param_meta.global_shape[0]
+
+    head_dim = getattr(hf_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(hf_config, "hidden_size", None)
+        num_q_heads = getattr(hf_config, "num_attention_heads", None)
+        if hidden_size and num_q_heads:
+            head_dim = hidden_size // num_q_heads
+        else:
+            return False
+
+    # Expected difference: (infer_tp - num_kv_heads) * 2 * head_dim
+    expected_diff = (infer_tp_size - num_kv_heads) * 2 * head_dim
+    actual_diff = infer_global - train_global
+
+    if actual_diff == expected_diff:
+        logger.info(
+            f"[QKV_VALIDATION] {param_name}: Allowing shape difference due to KV replication. "
+            f"train_global={train_global}, infer_global={infer_global}, "
+            f"expected_diff={expected_diff}, infer_tp={infer_tp_size}, num_kv_heads={num_kv_heads}"
+        )
+        return True
+
+    return False
+
+
 def check_train_infer_params_meta(
     training_params_meta: List,
     infer_parameters_meta: List,
     raise_exception: bool = False,
+    hf_config=None,
 ):
     infer_meta = {param_meta.name: param_meta for param_meta in infer_parameters_meta}
     train_meta = {param_meta.name: param_meta for param_meta in training_params_meta}
@@ -171,21 +232,28 @@ def check_train_infer_params_meta(
     for param_name in common_params:
         infer_param_meta = infer_meta[param_name]
         train_param_meta = train_meta[param_name]
-        if infer_param_meta.global_numel != train_param_meta.global_numel:
-            error_msg = (
-                f"Inconsistent number of elements for parameter {param_name}: "
-                f"{infer_param_meta.global_numel} != {train_param_meta.global_numel}"
-            )
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
-        if infer_param_meta.global_shape != train_param_meta.global_shape:
-            error_msg = f"Inconsistent shape for parameter {param_name}: {infer_param_meta.global_shape} != {train_param_meta.global_shape}"
-            if raise_exception:
-                raise ValueError(error_msg)
-            else:
-                logger.error(error_msg)
+
+        # Skip shape/numel validation for qkv_proj with KV head replication
+        skip_shape_check = _is_qkv_param_with_kv_replication(
+            param_name, infer_param_meta, train_param_meta, hf_config
+        )
+
+        if not skip_shape_check:
+            if infer_param_meta.global_numel != train_param_meta.global_numel:
+                error_msg = (
+                    f"Inconsistent number of elements for parameter {param_name}: "
+                    f"{infer_param_meta.global_numel} != {train_param_meta.global_numel}"
+                )
+                if raise_exception:
+                    raise ValueError(error_msg)
+                else:
+                    logger.error(error_msg)
+            if infer_param_meta.global_shape != train_param_meta.global_shape:
+                error_msg = f"Inconsistent shape for parameter {param_name}: {infer_param_meta.global_shape} != {train_param_meta.global_shape}"
+                if raise_exception:
+                    raise ValueError(error_msg)
+                else:
+                    logger.error(error_msg)
         if infer_param_meta.dtype != train_param_meta.dtype:
             error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
             if raise_exception:

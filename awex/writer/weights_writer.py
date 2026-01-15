@@ -176,14 +176,26 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         logger.info(
             f"Start to get inference parameters meta from meta server for rank {dist.get_rank()}"
         )
+        # In colocate mode, GPU memory is partially offloaded, so we need to use Gloo backend
+        # for collective operations instead of NCCL which requires CUDA memory
+        if self.enable_colocate_mode:
+            # Create or get a Gloo-based process group for CPU collective operations
+            if not hasattr(self, '_gloo_group'):
+                self._gloo_group = dist.new_group(
+                    ranks=list(range(dist.get_world_size())),
+                    backend='gloo'
+                )
+            broadcast_group = self._gloo_group
+        else:
+            broadcast_group = None  # Use default group
         if rank == 0:
             infer_params_meta_binary = self.meta_server_client.get_binary(
                 "infer_params_meta", timeout=self.timeout
             )
-            dist.broadcast_object_list([infer_params_meta_binary], src=0)
+            dist.broadcast_object_list([infer_params_meta_binary], src=0, group=broadcast_group)
         else:
             result = [None]
-            dist.broadcast_object_list(result, src=0)
+            dist.broadcast_object_list(result, src=0, group=broadcast_group)
             infer_params_meta_binary = result[0]
         self.infer_params_meta: List[ParameterMeta] = from_binary(
             infer_params_meta_binary
@@ -193,6 +205,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             self.parameters_meta,
             self.infer_params_meta,
             raise_exception=not self.enable_debug_mode,
+            hf_config=self.hf_config,
         )
         self.weight_converter = get_train_weights_converter(
             self.train_engine.engine_name,

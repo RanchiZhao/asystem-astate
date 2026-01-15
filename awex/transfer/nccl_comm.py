@@ -160,6 +160,12 @@ class NcclColocateTransport:
             p2p_recv_op_groups.append(p2p_recv_ops)
             stage_offsets.append(stage_offset)
             stage += 1
+        # [PROFILE] Phase 1: Build ops complete
+        build_ops_time = time.time() - start_time
+        logger.info(f"[PROFILE] rank={rank_coordinate} build_ops: {build_ops_time:.3f}s (stages={len(stage_offsets)}, sends={num_sends}, recvs={num_recvs})")
+
+        # [PROFILE] Phase 2: Local copy
+        copy_start = time.time()
         if len(tensors_to_copy) > 0:
             send_rank = infer_to_train_device_mapping[transfer_rank]
             execute_tensors_to_copy(
@@ -170,6 +176,14 @@ class NcclColocateTransport:
             )
         else:
             logger.info(f"No tensors to copy for {rank_coordinate}")
+        copy_time = time.time() - copy_start
+        logger.info(f"[PROFILE] rank={rank_coordinate} local_copy: {copy_time:.3f}s ({len(tensors_to_copy)} tensors)")
+
+        # [PROFILE] Phase 3: P2P transfer
+        p2p_start = time.time()
+        total_barrier_time = 0.0
+        total_send_time = 0.0
+        total_recv_time = 0.0
 
         # Execute p2p operations in two phases per stage so each batch_isend_irecv only
         # contains sends OR receives (not both), and peer ranks do complementary ops.
@@ -187,39 +201,55 @@ class NcclColocateTransport:
                     transfer_rank, stage_offset, world_size
                 )
                 # Phase 1: Partition 0 sends, partition 1 receives
+                phase1_start = time.time()
                 if partition == 0:
                     if send_ops:
                         execute_p2p_op_list(
                             send_ops, f"p2p send for {stage_name}", weights_update_group
                         )
+                        total_send_time += time.time() - phase1_start
                 else:
                     if recv_ops:
                         execute_p2p_op_list(
                             recv_ops, f"p2p recv for {stage_name}", weights_update_group
                         )
+                        total_recv_time += time.time() - phase1_start
 
                 # Global barrier after Phase 1 to ensure all ranks complete before Phase 2
                 # This is necessary because NCCL might have internal state that requires synchronization
+                barrier1_start = time.time()
                 dist.barrier(group=weights_update_group)
+                total_barrier_time += time.time() - barrier1_start
 
                 # Phase 2: Partition 0 receives, partition 1 sends
+                phase2_start = time.time()
                 if partition == 0:
                     if recv_ops:
                         execute_p2p_op_list(
                             recv_ops, f"p2p recv for {stage_name}", weights_update_group
                         )
+                        total_recv_time += time.time() - phase2_start
                 else:
                     if send_ops:
                         execute_p2p_op_list(
                             send_ops, f"p2p send for {stage_name}", weights_update_group
                         )
+                        total_send_time += time.time() - phase2_start
 
                 # Global barrier after Phase 2 to ensure all ranks complete before next stage
+                barrier2_start = time.time()
                 dist.barrier(group=weights_update_group)
+                total_barrier_time += time.time() - barrier2_start
             # No additional barrier here; Phase 2 per-pair barrier above prevents early advance
 
         # No final global barrier here
+        p2p_time = time.time() - p2p_start
         logger.info(f"[{os.getpid()}] All p2p stages completed for {rank_coordinate}")
+        logger.info(
+            f"[PROFILE] rank={rank_coordinate} p2p_detail: "
+            f"send={total_send_time:.3f}s recv={total_recv_time:.3f}s barrier={total_barrier_time:.3f}s "
+            f"p2p_total={p2p_time:.3f}s"
+        )
 
         duration = time.time() - start_time
         logger.info(
@@ -237,6 +267,37 @@ def execute_tensors_to_copy(tensors_to_copy, copy_ops, recv_parameters, stage: s
     for send_tensor, recv_op in zip(tensors_to_copy, copy_ops):
         recv_tensor = recv_parameters[recv_op.recv_shard_meta.name]
         recv_tensor_sliced = slice_tensor(recv_tensor, recv_op, False)
+
+        # [DIFF_CHECK] Compare before/after values to detect data mismatch
+        # Training updates are sparse, so large differences indicate problems
+        diff = (recv_tensor_sliced.float() - send_tensor.float()).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+
+        # Log key parameters for debugging
+        param_name = recv_op.recv_shard_meta.name
+        should_log = (
+            "embed_tokens" in param_name or
+            "lm_head" in param_name or
+            "qkv_proj" in param_name or
+            ("experts" in param_name and "layers.0." in param_name) or
+            "layers.0.mlp" in param_name
+        )
+        if should_log:
+            logger.info(
+                f"[COPY_DIFF] {param_name}: max={max_diff:.4f} mean={mean_diff:.6f} "
+                f"shape={send_tensor.shape} "
+                f"dst_sum={recv_tensor_sliced.float().sum():.4f} src_sum={send_tensor.float().sum():.4f}"
+            )
+
+        # [VERIFY] Log self-copy details for qkv_proj
+        if "qkv_proj" in recv_op.recv_shard_meta.name and "layers.0." in recv_op.recv_shard_meta.name:
+            logger.info(
+                f"[SELF_COPY] {recv_op.recv_shard_meta.name}: "
+                f"send_shape={send_tensor.shape} send_sum={send_tensor.float().sum():.6f} "
+                f"recv_shape={recv_tensor.shape} recv_slice_shape={recv_tensor_sliced.shape} "
+                f"inf_slices={recv_op.inf_slices} train_slices={recv_op.train_slices}"
+            )
         recv_tensor_sliced.copy_(send_tensor)
     duration = time.time() - start_time
     torch.cuda.synchronize(device=torch.cuda.current_device())

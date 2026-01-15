@@ -95,6 +95,8 @@ ModelRegistry = _ModelRegistry(import_model_configs())
 
 def get_sharding_strategy(model_name: str):
     config = ModelRegistry.get_model_config(model_name)
+    if isinstance(config, dict):
+        return config.get("sharding_strategy", ShardingStrategy)
     return config.sharding_strategy
 
 
@@ -107,7 +109,10 @@ def get_train_weights_converter(
 ):
     config = ModelRegistry.get_model_config(model_name)
     if engine_name == "mcore":
-        converter = config.mcore_converter or McoreToHFWeightConverter
+        if isinstance(config, dict):
+            converter = config.get("mcore_converter") or McoreToHFWeightConverter
+        else:
+            converter = config.mcore_converter or McoreToHFWeightConverter
         return converter(hf_config, rank_info, infer_conf)
     else:
         raise NotImplementedError(f"Engine {engine_name} not implemented.")
@@ -122,7 +127,10 @@ def get_infer_weights_converter(
 ):
     config = ModelRegistry.get_model_config(model_name)
     if engine_name == "sglang":
-        converter = config.sglang_converter or SGlangToHFWeightConverter
+        if isinstance(config, dict):
+            converter = config.get("sglang_converter") or SGlangToHFWeightConverter
+        else:
+            converter = config.sglang_converter or SGlangToHFWeightConverter
         return converter(hf_config, infer_engine_config, rank_info)
     else:
         raise NotImplementedError(f"Engine {engine_name} not implemented.")

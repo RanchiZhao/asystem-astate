@@ -55,6 +55,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             self.training_world_size,
             self.num_infer_engines,
             self.enable_debug_mode,
+            hf_config=self.hf_config,
         ).build_local_transfer_plan(
             self.infer_params_meta,
             self.parameters_meta,
@@ -131,7 +132,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         torch.cuda.set_device(gpu_id)
 
     def _init_writer_in_colocate_mode(self):
-        self.ipc_backend = self.asystem_train_config.get(
+        self.ipc_backend = self.config.get(
             "weights_exchange_ipc_backend", "cuda"
         )
         # Don't get IPC tensors here since every step, the memory address for weights will change
@@ -211,6 +212,10 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         logger.info(
             f"Start to write weights in colocate mode for rank {self.transfer_rank}"
         )
+        # CRITICAL: Resume memory before accessing model parameters
+        # In Slime's offload_train mode, model weights are on CPU after sleep()
+        # We need to bring them back to GPU before convert_parameters() can work
+        self.train_engine.resume_memory_occupation("weights")
         self.train_engine.release_grad_memory()
         converted = self.convert_parameters()
         tensors, names = [], []
@@ -222,9 +227,17 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
 
     @torch.no_grad()
     def _write_weights_in_colocate_mode(self, step_id, **kwargs):
-        start_time = time.time()
+        total_start = time.time()
+
+        # [PROFILE] Step 1: Prepare params (resume + convert)
+        t0 = time.time()
         tensors, names = self._prepare_params_for_colocate()
         num_tensors = len(tensors)
+        t1 = time.time()
+        prepare_time = t1 - t0
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} prepare_params: {prepare_time:.3f}s ({num_tensors} tensors)")
+
+        # [PROFILE] Step 2: Group tensors
         if self.ipc_backend == "cpu":
             tensors = [t.cpu() for t in tensors]
         logger.info(
@@ -233,24 +246,39 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         # this will copy tensor by concatenate
         group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
         torch.cuda.synchronize(device=torch.cuda.current_device())
-        logger.info(
-            f"Finished grouping tensors by shape and dtype for rank {self.transfer_rank}"
-        )
+        t2 = time.time()
+        group_time = t2 - t1
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} group_tensors: {group_time:.3f}s ({len(group_tensors)} groups)")
+
+        # [VERIFY] Log group_tensors summary for IPC correctness verification
+        for i, gt in enumerate(group_tensors[:3]):
+            logger.info(f"[IPC_SEND] rank={self.transfer_rank} group_{i}: shape={gt.shape} mean={gt.float().mean():.6f} sum={gt.float().sum():.6f}")
         print_current_gpu_status(
             f"after group_tensors_by_shape_and_dtype for rank {self.transfer_rank}"
         )
         logger.info(f"Open fds before serialize: {count_open_fds()}")
 
-        release_tensors(tensors)
+        # NOTE: Do NOT call release_tensors(tensors) here!
+        # tensors are references to model parameters (via detach()), not copies.
+        # Calling release_tensors() would destroy the model parameter storage,
+        # causing "CUDA error: invalid argument" when Slime tries to restore("ref").
+        # The data has already been cloned into group_tensors by group_tensors_by_shape_and_dtype().
         del tensors
+
+        # [PROFILE] Step 3: Offload weights
+        t3 = time.time()
         self.train_engine.release_memory_occupation("weights")
         self.meta_server_client.add_object_to_set(
             "all_training_offloaded_weights", self.transfer_rank
         )
+        t4 = time.time()
+        offload_time = t4 - t3
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} offload_weights: {offload_time:.3f}s")
         print_current_gpu_status(
             f"after offloaded weights for rank {self.transfer_rank}"
         )
 
+        # [PROFILE] Step 4: Serialize IPC
         if self.ipc_backend == "cpu":
             group_shared = [tensor.cpu().share_memory_() for tensor in group_tensors]
             serialized_weights = ipc_serialize((group_shared, metadata, names))
@@ -258,13 +286,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             group_shared = [tensor.cuda().share_memory_() for tensor in group_tensors]
             serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
         torch.cuda.synchronize(device=torch.cuda.current_device())
-        logger.info(
-            f"Finished serializing ipc weights with {num_tensors} params, and {len(group_shared)} groups "
-            f"for rank {self.transfer_rank}"
-        )
+        t5 = time.time()
+        serialize_time = t5 - t4
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} ipc_serialize: {serialize_time:.3f}s")
         logger.info(f"Open fds after serialize: {count_open_fds()}")
 
-        # Put serialized weights to meta server
+        # [PROFILE] Step 5: Put to metaserver and wait
         ip_address = get_ip_address()
         device_id = torch.cuda.current_device()
         key_suffix = f"_{ip_address}_{device_id}_{step_id}"
@@ -273,33 +300,33 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             serialized_weights_key,
             (self.transfer_rank, self.rank_info, serialized_weights),
         )
-        logger.info(
-            f"Put {len(group_shared)} serialized training weights to meta server "
-            f"with key {serialized_weights_key} for step {step_id}"
-        )
+        t6 = time.time()
+        put_time = t6 - t5
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} metaserver_put: {put_time:.3f}s")
+
         # Wait for inference engines to finish processing
         update_finished_key = f"weights_update_finished{key_suffix}"
         self.meta_server_client.get_object(update_finished_key, timeout=self.timeout)
+        t7 = time.time()
+        wait_time = t7 - t6
+        logger.info(f"[PROFILE] train_rank={self.transfer_rank} step={step_id} wait_inference: {wait_time:.3f}s")
+
+        # Cleanup - simplified (Reader no longer waits for write_finished)
         self.meta_server_client.delete_if_exists(update_finished_key)
         release_tensors(group_tensors)
         release_tensors(group_shared)
         del group_tensors
         del group_shared
+        gc.collect()  # Single gc.collect() is sufficient
         torch.cuda.synchronize(device=torch.cuda.current_device())
-        gc.collect()
         torch.cuda.empty_cache()
-        print_current_gpu_status(
-            f"after clear group_shared for rank {self.transfer_rank}"
-        )
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.put_object(write_finished_key, True)
-        duration = time.time() - start_time
-        compute_statistics(
-            self._history_write_weights_time,
-            step_id,
-            duration,
-            "Send weights using NCCL in colocate mode",
-        )
+        t8 = time.time()
+        cleanup_time = t8 - t7
+        total_time = t8 - total_start
+
         logger.info(
-            f"Finished writing weights in colocate mode for rank {self.transfer_rank}"
+            f"[PROFILE] train_rank={self.transfer_rank} step={step_id} SUMMARY: "
+            f"prepare={prepare_time:.2f}s group={group_time:.2f}s offload={offload_time:.2f}s "
+            f"serialize={serialize_time:.2f}s put={put_time:.2f}s wait={wait_time:.2f}s "
+            f"cleanup={cleanup_time:.2f}s total={total_time:.2f}s"
         )

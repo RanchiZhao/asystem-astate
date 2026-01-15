@@ -59,6 +59,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_world_size,
             self.num_engines,
             self.enable_debug_mode,
+            hf_config=self.hf_config,
         )
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta,
@@ -202,6 +203,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_world_size,
             self.num_engines,
             self.enable_debug_mode,
+            hf_config=self.hf_config,
         )
         self.send_transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta,
@@ -250,6 +252,9 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         else:
             group_shared, metadata, names = cuda_ipc_deserialize(serialized_weights)
         torch.cuda.synchronize(device=torch.cuda.current_device())
+        # [VERIFY] Log group_shared summary for IPC correctness verification
+        for i, gs in enumerate(group_shared[:3]):
+            logger.info(f"[IPC_RECV] rank={self.rank_coordinate} group_{i}: shape={gs.shape} mean={gs.float().mean():.6f} sum={gs.float().sum():.6f}")
         tensors = reconstruct_tensors_from_groups(group_shared, metadata)
         torch.cuda.synchronize(device=torch.cuda.current_device())
         self.deserialized_weights = dict(zip(names, tensors))
@@ -320,12 +325,38 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
 
     def _update_weights_in_colocate_mode(self, step_id, **kwargs):
         assert self.enable_colocate_mode, "Colocate mode is not enabled"
+        total_start = time.time()
+
+        # [PROFILE] Step 1: Collect training weights (IPC deserialization)
+        t0 = time.time()
         self.collect_training_weights(step_id, **kwargs)
+        t1 = time.time()
+        ipc_time = t1 - t0
+        logger.info(f"[PROFILE] rank={self.transfer_rank} step={step_id} ipc_deserialize: {ipc_time:.3f}s")
+
+        # [PROFILE] Step 2: Refresh parameter views
+        # CRITICAL: Refresh self.parameters to ensure views point to current storage
+        logger.info(f"[COLOCATE] Refreshing parameter views before P2P transfer for step {step_id}")
+        old_param_count = len(self.parameters)
+        self.parameters = {
+            hf_name: hf_param
+            for name, param in self.model.named_parameters()
+            for hf_name, hf_param in self.weight_converter.convert_param(name, param)
+        }
+        t2 = time.time()
+        view_refresh_time = t2 - t1
+        logger.info(f"[PROFILE] rank={self.transfer_rank} step={step_id} view_refresh: {view_refresh_time:.3f}s ({len(self.parameters)} params)")
+
+        # Verify expert views share storage with original tensor (only on first sync)
+        if step_id == 0:
+            self._verify_expert_view_storage()
+
+        # [PROFILE] Step 3: P2P transfer
         logger.info(
             f"Start to update weights using NCCL for step {step_id} from {len(self.transfer_plan.operations)} "
             f"ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
-        start_time = time.time()
+        t3 = time.time()
         self.colocate_transport.update_weights_in_colocate_mode(
             self.train_to_infer_device_mapping,
             self.infer_to_train_device_mapping,
@@ -339,17 +370,25 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.parameters,
             step_id=step_id,
         )
+        torch.cuda.synchronize()
+        t4 = time.time()
+        p2p_time = t4 - t3
+        logger.info(f"[PROFILE] rank={self.transfer_rank} step={step_id} p2p_transfer: {p2p_time:.3f}s")
+
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )
         self.deserialized_weights = None
-        duration = time.time() - start_time
+        duration = time.time() - total_start
         compute_statistics(
             self._history_update_weights_time,
             step_id,
             duration,
             "Receive weights using NCCL",
         )
+
+        # [PROFILE] Step 4: Signal and barrier
+        t5 = time.time()
         ip_address = get_ip_address()
         device_id = torch.cuda.current_device()
         key_suffix = f"_{ip_address}_{device_id}_{step_id}"
@@ -359,13 +398,19 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         dist.barrier(
             group=self.weights_update_group, device_ids=[torch.cuda.current_device()]
         )
+        t6 = time.time()
+        barrier_time = t6 - t5
+        logger.info(f"[PROFILE] rank={self.transfer_rank} step={step_id} barrier: {barrier_time:.3f}s")
+
+        # [PROFILE] Step 5: Cleanup
+        # NOTE: Removed wait for write_finished - Reader doesn't need to wait for Writer cleanup
+        # Data has already been copied via P2P, so Writer can cleanup asynchronously
+        t7 = time.time()
+        cleanup_time = t7 - t6
+        total_time = t7 - total_start
+
         logger.info(
-            f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
-        logger.info(
-            f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
+            f"[PROFILE] rank={self.transfer_rank} step={step_id} SUMMARY: "
+            f"ipc={ipc_time:.2f}s view={view_refresh_time:.2f}s p2p={p2p_time:.2f}s "
+            f"barrier={barrier_time:.2f}s cleanup={cleanup_time:.2f}s total={total_time:.2f}s"
         )

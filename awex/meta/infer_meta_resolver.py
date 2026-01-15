@@ -46,6 +46,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             inference_engine: The inference engine object that can execute tasks in model workers.
             convert_params: Whether to convert the parameters to the Hugging Face format.
         """
+        import time
         super().__init__(inference_engine.hf_config)
         self._inference_engine = inference_engine
         self.infer_engine_config = inference_engine.config
@@ -53,6 +54,8 @@ class InferParamMetaResolver(ParamMetaResolver):
         self.convert_params = convert_params
         self.num_engines = num_engines
         self.engine_rank = engine_rank
+
+        logger.info(f"[PROFILE] InferParamMetaResolver.__init__: engine_rank={engine_rank}, convert_params={convert_params}")
 
         suffix = f"{engine_rank}_{os.getpid()}_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.json"
         if self._inference_engine.config.enable_debug_mode:
@@ -72,6 +75,8 @@ class InferParamMetaResolver(ParamMetaResolver):
             logger.info(
                 f"Inference rank {engine_rank}, non_converted_params_raw_meta: {abs_filename}"
             )
+        logger.info(f"[PROFILE] InferParamMetaResolver: Starting execute_task_in_model_worker for _get_model_param_info...")
+        t0 = time.time()
         self._params_raw_meta = inference_engine.execute_task_in_model_worker(
             self._get_model_param_info,
             engine_name=self.engine_name,
@@ -79,6 +84,8 @@ class InferParamMetaResolver(ParamMetaResolver):
             engine_rank=engine_rank,
             convert_params=self.convert_params,
         )
+        t1 = time.time()
+        logger.info(f"[PROFILE] InferParamMetaResolver: execute_task_in_model_worker completed in {t1-t0:.2f}s")
         if self._inference_engine.config.enable_debug_mode:
             filename = f"infer_params_raw_meta_{suffix}"
             abs_filename = os.path.abspath(filename)
@@ -87,13 +94,31 @@ class InferParamMetaResolver(ParamMetaResolver):
             logger.info(
                 f"Inference rank {engine_rank}, params_raw_meta: {abs_filename}"
             )
-        rank0_params = [
-            info for info in self._params_raw_meta if info["rank_info"].global_rank == 0
-        ]
-        if len(rank0_params) != 1:
-            logger.error(f"Expected 1 rank0 meta, got {rank0_params}")
-            raise ValueError(f"Expected 1 rank0 meta, got {len(rank0_params)}")
-        [self._rank0_meta] = rank0_params
+
+        # In colocate mode, we only have LOCAL metadata (one rank).
+        # In non-colocate mode, we have metadata from ALL ranks.
+        # We use the available metadata to initialize, prioritizing rank 0 if available.
+        enable_colocate = getattr(self._inference_engine.config, "enable_colocate_mode", False)
+        if enable_colocate:
+            # Colocate mode: use local metadata (only one entry)
+            if len(self._params_raw_meta) != 1:
+                logger.warning(f"Colocate mode: expected 1 local meta, got {len(self._params_raw_meta)}")
+            local_meta = self._params_raw_meta[0]
+            self._rank0_meta = local_meta  # Use local as reference
+            logger.info(
+                f"[COLOCATE] Using local metadata from rank {local_meta['rank_info'].global_rank} "
+                f"as reference (world_size={local_meta['rank_info'].world_size})"
+            )
+        else:
+            # Non-colocate mode: find rank 0's metadata
+            rank0_params = [
+                info for info in self._params_raw_meta if info["rank_info"].global_rank == 0
+            ]
+            if len(rank0_params) != 1:
+                logger.error(f"Expected 1 rank0 meta, got {rank0_params}")
+                raise ValueError(f"Expected 1 rank0 meta, got {len(rank0_params)}")
+            [self._rank0_meta] = rank0_params
+
         self.rank0_info = self._rank0_meta["rank_info"]
         self._world_size = self.rank0_info.world_size
         self._model_arch_name = self._rank0_meta["model_arch_name"]
@@ -163,14 +188,30 @@ class InferParamMetaResolver(ParamMetaResolver):
             rank_info=rank_info,
         )
         params = []
+        logger.info(f"[DEBUG] Start iterating model.named_parameters(), rank={rank_info.global_rank}, convert_params={convert_params}")
+        import time
+        t_start = time.time()
+        param_count = 0
+        convert_time = 0.0
         for name, param in model.named_parameters():
             if convert_params:
-                for hf_name, hf_param in sglang_to_hf_weight_converter.convert_param(
-                    name, param
-                ):
-                    params.append((hf_name, hf_param))
+                t_convert_start = time.time()
+                try:
+                    converted = sglang_to_hf_weight_converter.convert_param(name, param)
+                    for hf_name, hf_param in converted:
+                        params.append((hf_name, hf_param))
+                except Exception as e:
+                    logger.error(f"[ERROR] convert_param failed for {name}: {e}")
+                    raise
+                convert_time += time.time() - t_convert_start
             else:
                 params.append((name, param))
+            param_count += 1
+            if param_count % 200 == 0:
+                elapsed = time.time() - t_start
+                logger.info(f"[DEBUG] Processed {param_count} parameters in {elapsed:.2f}s (convert_time={convert_time:.2f}s), rank={rank_info.global_rank}")
+        t_end = time.time()
+        logger.info(f"[DEBUG] Finished iterating {param_count} parameters in {t_end-t_start:.2f}s (convert_time={convert_time:.2f}s), rank={rank_info.global_rank}")
         for name, param in params:
             if not param.is_contiguous():
                 logger.info(
